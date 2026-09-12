@@ -15,6 +15,27 @@ catfact.getFact:
   headers: {}
   jq: .fact
   help: Fetch a random cat fact.
+celeris.chat:
+  url: https://inference.celeris.ai/celeris-1-magnus/v1/chat/completions
+  method: POST
+  stream: true
+  headers:
+    Content-Type: application/json
+    Authorization: "Bearer $!CELERIS_API_KEY"
+  body: |
+    {
+      "model": "celeris-1-magnus",
+      "messages": [{"role": "system", "content": "$SYSTEM_PROMPT"}, {"role": "user", "content": "$!PROMPT"}]
+    }
+  stream_jq: .choices[0].delta.content // .choices[0].delta.reasoning // empty
+  jq: .choices[0].message.content
+  help: Create a Celeris AI chat completion using celeris-1-magnus. Requires CELERIS_API_KEY and PROMPT.
+celeris.models:
+  url: https://inference.celeris.ai/celeris-1-magnus/v1/models
+  headers:
+    Authorization: "Bearer $!CELERIS_API_KEY"
+  jq: .data[].id
+  help: List available Celeris models. Requires CELERIS_API_KEY.
 cerebras.chat:
   url: https://api.cerebras.ai/v1/chat/completions
   method: POST
@@ -215,7 +236,25 @@ inception.chat:
     Content-Type: application/json
     Authorization: Bearer $!INCEPTION_API_KEY
   body: |
-    { "model": "mercury-2", "reasoning_effort": "$!REASONING_EFFORT", "messages": [{"role":"user", "content":"$!PROMPT"}] }
+    {
+      "model": "mercury-2.5",
+      "messages": [{"role": "system", "content": "$SYSTEM_PROMPT"}, {"role": "user", "content": "$!PROMPT"}]
+    }
+  jq: .choices[0].message.content
+  help: Inception AI chat completion using flagship Mercury 2.5. Requires INCEPTION_API_KEY and PROMPT.
+inception.models:
+  url: https://api.inceptionlabs.ai/v1/models
+  headers:
+    Authorization: Bearer $!INCEPTION_API_KEY
+  jq: |
+    (["Model","Context","Max Output","Prompt $/1M","Completion $/1M"],
+     ([.data[] | [.id, (.context_length|tostring), (.max_output_length|tostring),
+       ((((.pricing.prompt|tonumber)*1000000*100|round)/100)|tostring),
+       ((((.pricing.completion|tonumber)*1000000*100|round)/100)|tostring)]]
+      | sort_by(.[0])
+      | .[]))
+    | @tsv
+  help: List Inception AI models with context length, max output, and per-1M token pricing. Requires INCEPTION_API_KEY.
 mlx.chat:
   url: http://localhost:8080/v1/chat/completions
   method: POST

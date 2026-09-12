@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { join } from 'node:path';
-import { fetchApi, fetchWS, getApi, getApis, getFlow, getRequest, isReadableFile, parseJsonResponse, runJq } from './fetch.js';
+import { fetchApi, fetchWS, getApi, getApis, getFlow, getRequest, isReadableFile, parseJsonResponse, runJq, parseSseStream, parseNdjsonStream, formatStreamChunk } from './fetch.js';
 import { ensureUserConfig, defaultUserConfigPath, defaultBundledConfigPath } from './install.js';
 import { startProxy, checkBackend } from './proxy.js';
 import { parseYaml } from './yaml.js';
@@ -17,15 +17,19 @@ ${c.bold}Commands${c.reset}
   ${c.green}apic <service.name>${c.reset} [k=v …]  Call API with optional params
   ${c.cyan}apic ls|list${c.reset} [pattern]       List APIs
   ${c.cyan}apic update${c.reset}                  Copy latest published ${c.dim}.apicat${c.reset} to ${c.dim}~/.apicat${c.reset}
+  ${c.cyan}apic help${c.reset} [service|pattern]  Show help or search config for pattern
   ${c.cyan}apic <service.name> --help${c.reset}   Show help for this api call
-  ${c.cyan}apic proxy -p <port>${c.reset} [${c.dim}-P <backend host:port>${c.reset}] [${c.dim}-B <env key name>${c.reset}]
+  ${c.cyan}apic proxy -p <port>${c.reset} [${c.dim}-P <backend host:port>${c.reset}] [${c.dim}-B|--bearer <env key name>${c.reset}]
                        Forward HTTP requests; -P pins the backend target, -B adds a Bearer auth header from an env var
 
 ${c.bold}Options${c.reset}
-  ${c.cyan}apic <service.name> --time${c.reset}          Show request duration
-  ${c.cyan}apic <service.name> --debug${c.reset}         Show fetch request/response info
+  ${c.cyan}apic <service.name> --time${c.reset}           Show request duration
+  ${c.cyan}apic <service.name> --debug${c.reset}          Show fetch request/response info
   ${c.cyan}apic <service.name> --response${c.reset}       Output raw response (skip jq filter)
-  ${c.cyan}apic --config <path> httpbin.get${c.reset}    Use custom config file instead of ${c.dim}~/.apicat${c.reset}
+  ${c.cyan}apic <service.name> --stream${c.reset}         Stream response events / tokens (default if not specified)
+  ${c.cyan}apic <service.name> --no-stream${c.reset}      Disable streaming (wait for full response)
+  ${c.cyan}apic --config <path> httpbin.get${c.reset}     Use custom config file instead of ${c.dim}~/.apicat${c.reset}
+  ${c.cyan}apic -h, --help${c.reset}                      Show help
 `;
 
 export const formatResponse = (text, jq) => jq ? runJq(jq, text).trimEnd() : JSON.stringify(parseJsonResponse(text), null, 2);
@@ -52,7 +56,7 @@ const apiParams = (api) => {
 };
 
 export const parseArgs = (raw = []) => {
-  const flags = ['-time', '--time', '-debug', '--debug', '-h', '--help', '-p', '-P', '-B', '--bearer', '-response', '--response'];
+  const flags = ['-time', '--time', '-debug', '--debug', '-h', '--help', '-p', '-P', '-B', '--bearer', '-response', '--response', '-stream', '--stream', '-no-stream', '--no-stream'];
   const configIdx = raw.findIndex(a => a === '-config' || a === '--config');
   const portIdx = raw.indexOf('-p');
   const backendIdx = raw.indexOf('-P');
@@ -64,11 +68,12 @@ export const parseArgs = (raw = []) => {
   const skip = new Set();
   for (const i of [configIdx, portIdx, backendIdx, bearerIdx]) if (i >= 0) skip.add(i).add(i + 1);
   const args = raw.filter((a, i) => !flags.includes(a) && !skip.has(i));
-  return { args, arg: args[0], pattern: args[1] ?? '.', time: raw.includes('-time') || raw.includes('--time'), debug: raw.includes('-debug') || raw.includes('--debug'), response: raw.includes('-response') || raw.includes('--response'), help: raw.includes('-h') || raw.includes('--help'), configPath: configIdx >= 0 ? raw[configIdx + 1] : null, port: portIdx >= 0 ? raw[portIdx + 1] : null, proxyBackend: backendIdx >= 0 ? raw[backendIdx + 1] : null, proxyBearer: bearerIdx >= 0 ? raw[bearerIdx + 1] : null };
+  return { args, arg: args[0], pattern: args[1] ?? '.', time: raw.includes('-time') || raw.includes('--time'), debug: raw.includes('-debug') || raw.includes('--debug'), response: raw.includes('-response') || raw.includes('--response'), stream: raw.includes('-stream') || raw.includes('--stream'), noStream: raw.includes('-no-stream') || raw.includes('--no-stream'), help: raw.includes('-h') || raw.includes('--help'), configPath: configIdx >= 0 ? raw[configIdx + 1] : null, port: portIdx >= 0 ? raw[portIdx + 1] : null, proxyBackend: backendIdx >= 0 ? raw[backendIdx + 1] : null, proxyBearer: bearerIdx >= 0 ? raw[bearerIdx + 1] : null };
 };
 
 export async function runCli(raw = process.argv.slice(2), io = {}) {
   const out = io.out ?? console.log, err = io.err ?? console.error;
+  const write = io.write ?? (io.out ? io.out : (s) => process.stdout.write(s));
   const cwd = io.cwd ?? process.cwd();
   const localConfigPath = io.localConfigPath ?? join(cwd, '.apicat');
   const userConfigPath = io.userConfigPath ?? defaultUserConfigPath;
@@ -82,7 +87,7 @@ export async function runCli(raw = process.argv.slice(2), io = {}) {
 
   const resolveBase = () => (hasLocal() ? localConfigPath : hasUser() ? userConfigPath : hasBundled() ? bundledConfigPath : null);
 
-  const { error, args, arg, pattern, time, debug, response, help, configPath, port, proxyBackend, proxyBearer } = parseArgs(raw);
+  const { error, args, arg, pattern, time, debug, response, stream, noStream, help, configPath, port, proxyBackend, proxyBearer } = parseArgs(raw);
   const re = (s) => new RegExp(s.replace(/\*/g, '.*'), 'i');
 
   const printConfig = () => {
@@ -143,6 +148,7 @@ export async function runCli(raw = process.argv.slice(2), io = {}) {
 
   if (error) return err(error), 1;
   if (arg === 'proxy') {
+    if (help) return out(usage), 0;
     try {
       if (proxyBackend && !(await checkBackend(proxyBackend))) {
         err(`Error: cannot reach proxy backend ${proxyBackend}`);
@@ -156,8 +162,8 @@ export async function runCli(raw = process.argv.slice(2), io = {}) {
     }
   }
   await ensureUserConfig({ arg, configPath, localConfigPath, userConfigPath, bundledConfigPath });
-  if (!args.length) printConfig();
-  if (!arg) return out(usage), 0;
+  if (!args.length || (arg === 'help' && !args[1])) printConfig();
+  if (!arg || (help && !/^\w+\.\w+$/.test(arg)) || (arg === 'help' && !args[1])) return out(usage), 0;
   if (arg === 'ls' || arg === 'list') {
     out('');
     for (const a of getApis(configPath, io).sort((a, b) => (a.id ?? `${a.service}.${a.name}`).localeCompare(b.id ?? `${b.service}.${b.name}`))) {
@@ -170,7 +176,16 @@ export async function runCli(raw = process.argv.slice(2), io = {}) {
     out('');
     return 0;
   }
-  if (arg === 'help') return search(re(pattern)), 0;
+  if (arg === 'help') {
+    if (/^\w+\.\w+$/.test(pattern)) {
+      const [s, n] = pattern.split('.');
+      const { base, steps } = getFlow(s, n, configPath, io), a = base ?? getApi(s, n, configPath, io);
+      if (base || a || steps.length) {
+        return out(base?.help ?? a?.help ?? steps[0]?.help ?? 'No help available.'), 0;
+      }
+    }
+    return search(re(pattern)), 0;
+  }
   if (arg === 'update') {
     try { await update(); return 0; } catch (e) { err(e.message); return 1; }
   }
@@ -186,6 +201,8 @@ export async function runCli(raw = process.argv.slice(2), io = {}) {
   const jsonPost = api?.method === 'POST' && (typeof api.headers === 'string' ? /json|^bearer /i.test(api.headers) : Object.entries(api?.headers || {}).some(([k, v]) => k.toLowerCase() === 'content-type' && String(v).toLowerCase().includes('json')));
   const opts = isWs || hasBody || hasUpload ? { vars: params, configPath, ...io } : jsonPost ? { body: JSON.stringify(params), configPath, ...io } : { vars: params, configPath, ...io };
   if (debug) opts.debug = true;
+  if (stream) opts.stream = true;
+  if (noStream) opts.noStream = true;
   try {
     const t0 = time ? process.hrtime.bigint() : null;
     let elapsed;
@@ -210,9 +227,37 @@ export async function runCli(raw = process.argv.slice(2), io = {}) {
         fs.writeFileSync(output, Buffer.from(await res.arrayBuffer()));
         out(output);
       } else {
-        const text = await res.text();
-        if (debug) err(`\n\x1b[90m< response body:\n%s\x1b[0m`, text);
-        out(response ? text : formatResponse(text, api?.jq));
+        const contentType = res.headers.get('content-type') || '';
+        const isSse = contentType.includes('text/event-stream');
+        const isNdjson = contentType.includes('application/x-ndjson') || contentType.includes('application/jsonl');
+        const isStreaming = res.ok && res.body && !noStream && (isSse || isNdjson || stream || api?.stream);
+
+        if (isStreaming && (isSse || isNdjson || !contentType.includes('application/json'))) {
+          const streamParser = isNdjson ? parseNdjsonStream(res.body) : parseSseStream(res.body);
+          let lastChunkWritten = false;
+          let endsWithNewline = false;
+          for await (const ev of streamParser) {
+            if (ev.data === '[DONE]') break;
+            if (debug) err(`\n\x1b[90m< stream event (${ev.event}):\n%s\x1b[0m`, ev.raw);
+            if (response) {
+              write(ev.raw + '\n\n');
+              lastChunkWritten = true;
+              endsWithNewline = true;
+            } else {
+              const formatted = formatStreamChunk(ev.data, api?.stream_jq ?? api?.jq);
+              if (formatted != null && formatted !== '') {
+                write(formatted);
+                lastChunkWritten = true;
+                endsWithNewline = String(formatted).endsWith('\n');
+              }
+            }
+          }
+          if (lastChunkWritten && !endsWithNewline) write('\n');
+        } else {
+          const text = await res.text();
+          if (debug) err(`\n\x1b[90m< response body:\n%s\x1b[0m`, text);
+          out(response ? text : formatResponse(text, api?.jq));
+        }
       }
     }
     if (elapsed) err(`\x1b[90m%ims\x1b[0m`, elapsed);

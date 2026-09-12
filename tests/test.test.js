@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { formatResponse, runCli } from '../src/cli.js';
-import { fetchApi, getApis, getRequest } from '../src/fetch.js';
+import { fetchApi, getApis, getRequest, parseSseStream, parseNdjsonStream, formatStreamChunk } from '../src/fetch.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const config = join(root, 'apicat.yaml');
@@ -14,12 +14,48 @@ const uploadConfig = join(root, 'tests/fixtures/upload.yaml');
 const uploadFile = join(root, 'tests/fixtures/upload-body.txt');
 const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
-test('cli usage includes the package version', async () => {
+test('cli usage includes all options with --stream marked as default if not specified', async () => {
   const output = [];
   const code = await runCli([], { out: value => output.push(value) });
 
   assert.strictEqual(code, 0);
-  assert.match(output.join('\n'), new RegExp(`apicat\\x1b\\[0m \\x1b\\[90mv${version} — call APIs`));
+  const text = output.join('\n');
+  assert.match(text, new RegExp(`apicat\\x1b\\[0m \\x1b\\[90mv${version} — call APIs`));
+  assert.match(text, /--time/);
+  assert.match(text, /--debug/);
+  assert.match(text, /--response/);
+  assert.match(text, /--stream.*default if not specified/);
+  assert.match(text, /--no-stream/);
+  assert.match(text, /--config/);
+  assert.match(text, /-h, --help/);
+});
+
+test('cli --help and apic help display usage with all options', async () => {
+  const helpOutput = [];
+  const code1 = await runCli(['--help'], { out: value => helpOutput.push(value) });
+  assert.strictEqual(code1, 0);
+  const helpText = helpOutput.join('\n');
+  assert.match(helpText, /--stream.*default if not specified/);
+  assert.match(helpText, /--no-stream/);
+  assert.match(helpText, /-h, --help/);
+
+  const bareHelpOutput = [];
+  const code2 = await runCli(['help'], { out: value => bareHelpOutput.push(value) });
+  assert.strictEqual(code2, 0);
+  const bareHelpText = bareHelpOutput.join('\n');
+  assert.match(bareHelpText, /--stream.*default if not specified/);
+  assert.match(bareHelpText, /--no-stream/);
+  assert.match(bareHelpText, /-h, --help/);
+});
+
+test('apic help <service.name> prints API help text', async () => {
+  const output = [];
+  const code = await runCli(['-config', config, 'help', 'httpbin.get'], {
+    out: value => output.push(value)
+  });
+
+  assert.strictEqual(code, 0);
+  assert.deepStrictEqual(output, ['Send a GET request to httpbin.org/get.']);
 });
 
 test('api help prints the YAML help text without making a request', async () => {
@@ -305,4 +341,171 @@ test('explicit --config ignores .apicat and apicat.yaml in current directory', a
   assert.doesNotMatch(output.join('\n'), /localbase\.get/);
   assert.doesNotMatch(output.join('\n'), /localextra\.get/);
 });
+
+test('parseSseStream handles events, comments, and multiple data lines', async () => {
+  const sseContent = ': comment\n\ndata: first\n\ndata: second part 1\ndata: second part 2\nevent: custom\nid: 42\n\ndata: [DONE]\n\n';
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(sseContent));
+      controller.close();
+    }
+  });
+
+  const events = [];
+  for await (const ev of parseSseStream(stream)) {
+    events.push(ev);
+  }
+
+  assert.strictEqual(events.length, 3);
+  assert.strictEqual(events[0].data, 'first');
+  assert.strictEqual(events[0].event, 'message');
+  assert.strictEqual(events[1].data, 'second part 1\nsecond part 2');
+  assert.strictEqual(events[1].event, 'custom');
+  assert.strictEqual(events[1].id, '42');
+  assert.strictEqual(events[2].data, '[DONE]');
+});
+
+test('formatStreamChunk extracts delta tokens from OpenAI and Ollama chunks', () => {
+  assert.strictEqual(formatStreamChunk('{"choices":[{"delta":{"content":"Hello"}}]}', '.choices[0].message.content'), 'Hello');
+  assert.strictEqual(formatStreamChunk('{"choices":[{"delta":{"content":" world"}}]}', '.choices[0].delta.content'), ' world');
+  assert.strictEqual(formatStreamChunk('{"message":{"content":"Hi"}}', '.message.content'), 'Hi');
+  assert.strictEqual(formatStreamChunk('{"delta":{"text":"Anthropic"}}', null), 'Anthropic');
+  assert.strictEqual(formatStreamChunk('{"choices":[{"delta":{"reasoning":"Thinking step"}}]}', null), 'Thinking step');
+  assert.strictEqual(formatStreamChunk('{"choices":[{"delta":{"reasoning_content":"Thinking step 2"}}]}', null), 'Thinking step 2');
+  assert.strictEqual(formatStreamChunk('{"choices":[{"delta":{"reasoning":"Thinking step"}}]}', '.choices[0].delta.content // .choices[0].delta.reasoning // empty'), 'Thinking step');
+  assert.strictEqual(formatStreamChunk('{"choices":[{"delta":{"content":"Answer"}}]}', '.choices[0].delta.content // .choices[0].delta.reasoning // empty'), 'Answer');
+  assert.strictEqual(formatStreamChunk('{"choices":[{"delta":{}}]}', null), null);
+  assert.strictEqual(formatStreamChunk('[DONE]', '.choices[0].message.content'), null);
+  assert.strictEqual(formatStreamChunk('{"choices":[{"delta":{"role":"assistant"}}]}', '.choices[0].message.content'), null);
+  assert.strictEqual(formatStreamChunk('plain text', null), 'plain text');
+});
+
+test('cli streams SSE chat responses live without newlines between deltas', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const chunks = [
+    'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":" world"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"!"}}]}\n\n',
+    'data: [DONE]\n\n'
+  ];
+
+  globalThis.fetch = async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(new TextEncoder().encode(c));
+        controller.close();
+      }
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    });
+  };
+
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const written = [];
+  const code = await runCli(['-config', config, 'celeris.chat', 'PROMPT=hi'], {
+    write: chunk => written.push(chunk)
+  });
+
+  assert.strictEqual(code, 0);
+  assert.strictEqual(written.join(''), 'Hello world!\n');
+});
+
+test('cli streams raw SSE events when --response flag is specified', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const chunk = 'data: {"choices":[{"delta":{"content":"Test"}}]}\n\n';
+
+  globalThis.fetch = async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(chunk));
+        controller.close();
+      }
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    });
+  };
+
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const written = [];
+  const code = await runCli(['-config', config, 'celeris.chat', 'PROMPT=hi', '--response'], {
+    write: chunk => written.push(chunk)
+  });
+
+  assert.strictEqual(code, 0);
+  assert.match(written.join(''), /data: \{"choices":\[\{"delta":\{"content":"Test"\}\}\]\}/);
+});
+
+test('--stream flag sets stream in body and headers and --no-stream disables it', () => {
+  const reqStream = getRequest('ollama', 'chat', { OLLAMA_MODEL: 'm', PROMPT: 'p' }, config, { stream: true });
+  assert.strictEqual(JSON.parse(reqStream.body).stream, true);
+  assert.match(reqStream.headers.Accept, /text\/event-stream/);
+
+  const reqNoStream = getRequest('ollama', 'chat', { OLLAMA_MODEL: 'm', PROMPT: 'p' }, config, { noStream: true });
+  assert.strictEqual(JSON.parse(reqNoStream.body).stream, false);
+});
+
+test('cli streams NDJSON responses', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const ndjson = '{"message":{"content":"Line1"}}\n{"message":{"content":"Line2"}}\n';
+
+  globalThis.fetch = async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(ndjson));
+        controller.close();
+      }
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'application/x-ndjson' }
+    });
+  };
+
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const written = [];
+  const code = await runCli(['-config', config, 'ollama.chat', 'OLLAMA_MODEL=m', 'PROMPT=hi', '--stream'], {
+    write: chunk => written.push(chunk)
+  });
+
+  assert.strictEqual(code, 0);
+  assert.strictEqual(written.join(''), 'Line1Line2\n');
+});
+
+test('HTTP error responses on streaming endpoints fallback to error formatting', async (t) => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => {
+    return new Response(JSON.stringify({ error: { message: 'Invalid API key' } }), {
+      status: 401,
+      headers: { 'content-type': 'application/json' }
+    });
+  };
+
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const output = [];
+  const code = await runCli(['-config', config, 'celeris.chat', 'PROMPT=hi', '--stream', '--response'], {
+    out: value => output.push(value)
+  });
+
+  assert.strictEqual(code, 0);
+  assert.match(output.join('\n'), /Invalid API key/);
+});
+
 

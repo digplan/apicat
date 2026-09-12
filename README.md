@@ -28,13 +28,19 @@ Commands
   apic <service.name> [k=v …]  Call API with optional params
   apic ls|list [pattern]       List APIs (e.g. apic list "openrouter")
   apic update                  Copy latest published .apicat to ~/.apicat
+  apic help [service|pattern]  Show help or search config for pattern
   apic <service.name> --help   Show help for this api call
+  apic proxy -p <port> [-P <backend host:port>] [-B|--bearer <env key name>]
+                       Forward HTTP requests; -P pins the backend target, -B adds a Bearer auth header from an env var
 
 Options
-  apic <service.name> --time          Show request duration
-  apic <service.name> --debug         Show fetch request/response info + full response body
-  apic <service.name> --response      Output raw response (skip jq filter)
-  apic --config <path> httpbin.get    Use custom config file instead of ~/.apicat
+  apic <service.name> --time           Show request duration
+  apic <service.name> --debug          Show fetch request/response info + full response body
+  apic <service.name> --response       Output raw response (skip jq filter)
+  apic <service.name> --stream         Stream response events / tokens (default if not specified)
+  apic <service.name> --no-stream      Disable streaming (wait for full response)
+  apic --config <path> httpbin.get     Use custom config file instead of ~/.apicat
+  apic -h, --help                      Show help
 ```
 
 ## 🤖 Model Context Protocol (MCP) Server for AI Agents

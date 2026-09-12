@@ -154,11 +154,13 @@ export const getFlow = (s, n, p, options) => {
   return { base, steps };
 };
 
-export function getRequest(s, n, vars = {}, p, options) {
+export function getRequest(s, n, vars = {}, p, options = {}) {
   const api = getApi(s, n, p, options);
   if (!api) throw new Error(`Unknown API: ${s}.${n}`);
   const v = { ...vars }, provider = v.PROVIDER ?? process.env.PROVIDER;
-  let { url, method, headers, body, file, multipart, output } = api;
+  let { url, method, headers, body, file, multipart, output, stream } = api;
+  if (options.stream != null) stream = options.stream;
+  if (options.noStream) stream = false;
   url = sub(url, v);
   if (typeof headers === 'string' && headers.startsWith('BEARER ')) {
     headers = { Authorization: `Bearer ${sub(headers.slice(7).trim(), v)}`, 'Content-Type': 'application/json' };
@@ -169,11 +171,34 @@ export function getRequest(s, n, vars = {}, p, options) {
     const pb = ', "provider": {"order": ["$PROVIDER"]}';
     body = provider ? body.replace(pb, pb.replace('$PROVIDER', provider)) : body.replace(pb, '');
     body = sub(body, v, true);
+    if (stream) {
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed && typeof parsed === 'object') {
+          if (options.stream || parsed.stream == null) {
+            parsed.stream = true;
+            body = JSON.stringify(parsed);
+          }
+        }
+      } catch {}
+    } else if (options.noStream) {
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed && typeof parsed === 'object') {
+          parsed.stream = false;
+          body = JSON.stringify(parsed);
+        }
+      } catch {}
+    }
+  }
+  if (stream && headers && typeof headers === 'object') {
+    const hasAccept = Object.keys(headers).some(k => k.toLowerCase() === 'accept');
+    if (!hasAccept) headers.Accept = 'text/event-stream, application/json, */*';
   }
   file = sub(file, v);
   multipart = walk(multipart, v);
   output = sub(output, v);
-  return { url, method, headers, body, file, multipart, output };
+  return { url, method, headers, body, file, multipart, output, stream };
 }
 
 const getFileBody = (path) => {
@@ -588,3 +613,158 @@ export async function get(id, opts = {}) {
     text: () => text
   };
 }
+
+export async function* parseSseStream(readableStream) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = buffer.indexOf('\n\n')) !== -1 || (boundary = buffer.indexOf('\r\n\r\n')) !== -1) {
+        const isCr = buffer[boundary] === '\r';
+        const sepLen = isCr ? 4 : 2;
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + sepLen);
+        const event = parseSseBlock(block);
+        if (event) yield event;
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const event = parseSseBlock(buffer);
+      if (event) yield event;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function parseSseBlock(block) {
+  let event = 'message';
+  let dataLines = [];
+  let id = null;
+  const lines = block.split(/\r?\n/);
+  for (const line of lines) {
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(line[5] === ' ' ? 6 : 5));
+    } else if (line.startsWith('event:')) {
+      event = line.slice(line[6] === ' ' ? 7 : 6);
+    } else if (line.startsWith('id:')) {
+      id = line.slice(line[3] === ' ' ? 4 : 3);
+    }
+  }
+  if (!dataLines.length && !id && event === 'message') return null;
+  const data = dataLines.join('\n');
+  return { event, data, id, raw: block };
+}
+
+export async function* parseNdjsonStream(readableStream) {
+  const reader = readableStream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline;
+      while ((newline = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, newline).replace(/\r$/, '');
+        buffer = buffer.slice(newline + 1);
+        if (line.trim()) {
+          yield { event: 'message', data: line, raw: line };
+        }
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const line = buffer.replace(/\r$/, '');
+      if (line.trim()) yield { event: 'message', data: line, raw: line };
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export function formatStreamChunk(data, jq) {
+  if (data == null || data === '' || data === '[DONE]') return null;
+  let parsed;
+  try {
+    parsed = typeof data === 'object' ? data : JSON.parse(data);
+  } catch {
+    return data;
+  }
+  if (!parsed || typeof parsed !== 'object') return String(parsed);
+
+  if (jq) {
+    const trimmed = String(jq).trim();
+    if (trimmed === '.choices[0].message.content' || trimmed === 'choices[0].message.content') {
+      const deltaContent = parsed?.choices?.[0]?.delta?.content;
+      if (deltaContent !== undefined) return deltaContent;
+      const messageContent = parsed?.choices?.[0]?.message?.content;
+      if (messageContent !== undefined) return messageContent;
+      return null;
+    }
+    if (trimmed === '.choices[0].delta.content' || trimmed === 'choices[0].delta.content') {
+      return parsed?.choices?.[0]?.delta?.content ?? null;
+    }
+    if (
+      trimmed === '.choices[0].delta.content // .choices[0].delta.reasoning' ||
+      trimmed === '.choices[0].delta.content // .choices[0].delta.reasoning // empty' ||
+      trimmed === '.choices[0].delta.content // .choices[0].delta.reasoning // .choices[0].message.content' ||
+      trimmed === '.choices[0].delta | .content // .reasoning' ||
+      trimmed === '.choices[0].delta | .content // .reasoning // empty'
+    ) {
+      const delta = parsed?.choices?.[0]?.delta;
+      if (delta?.content !== undefined) return delta.content;
+      if (delta?.reasoning !== undefined) return delta.reasoning;
+      if (delta?.reasoning_content !== undefined) return delta.reasoning_content;
+      const messageContent = parsed?.choices?.[0]?.message?.content;
+      if (messageContent !== undefined) return messageContent;
+      return null;
+    }
+    if (trimmed === '.choices[0].delta.reasoning' || trimmed === 'choices[0].delta.reasoning') {
+      return parsed?.choices?.[0]?.delta?.reasoning ?? parsed?.choices?.[0]?.delta?.reasoning_content ?? null;
+    }
+    if (trimmed === '.message.content' || trimmed === 'message.content') {
+      return parsed?.message?.content ?? null;
+    }
+    try {
+      const out = runJq(jq, JSON.stringify(parsed));
+      return out ? out.trimEnd() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const delta = parsed?.choices?.[0]?.delta;
+  if (delta?.content !== undefined) {
+    return delta.content;
+  }
+  if (delta?.reasoning !== undefined) {
+    return delta.reasoning;
+  }
+  if (delta?.reasoning_content !== undefined) {
+    return delta.reasoning_content;
+  }
+  if (parsed?.delta?.text !== undefined) {
+    return parsed.delta.text;
+  }
+  if (parsed?.message?.content !== undefined) {
+    return parsed.message.content;
+  }
+  if (delta && (delta.role !== undefined || Object.keys(delta).length === 0)) {
+    return null;
+  }
+  if (Array.isArray(parsed?.choices) && parsed.choices.length === 0) {
+    return null;
+  }
+
+  return JSON.stringify(parsed);
+}
+
